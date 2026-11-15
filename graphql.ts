@@ -122,7 +122,10 @@ interface FragmentNode {
 
 class Parser {
   private pos = 0;
-  constructor(private readonly tokens: Token[]) {}
+  private readonly tokens: Token[];
+  constructor(tokens: Token[]) {
+    this.tokens = tokens;
+  }
 
   peek(): Token | undefined {
     return this.tokens[this.pos];

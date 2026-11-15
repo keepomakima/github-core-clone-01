@@ -66,9 +66,9 @@ function advertisements(repo: Repo): CachedAdvertisements {
   if (cached && cached.version === repo.version) return cached;
   const built: CachedAdvertisements = {
     version: repo.version,
-    v0Upload: pktLines([...v0RefLines(repo, UPLOAD_V0_CAPS), 'flush']),
+    v0Upload: pktLines(['# service=git-upload-pack\n', ...v0RefLines(repo, UPLOAD_V0_CAPS), 'flush']),
     v2Upload: pktLines(['version 2\n', 'agent=forge/1.0\n', 'ls-refs=unborn\n', 'fetch=shallow\n', 'object-format=sha1\n', 'flush']),
-    v0Receive: pktLines([...v0RefLines(repo, RECEIVE_V0_CAPS), 'flush']),
+    v0Receive: pktLines(['# service=git-receive-pack\n', ...v0RefLines(repo, RECEIVE_V0_CAPS), 'flush']),
   };
   advertisementCache.set(repo, built);
   return built;
@@ -282,6 +282,7 @@ function v2UploadPack(repo: Repo, body: Buffer): { status: number; contentType: 
     }
     const plan = planFetch(repo, wants, haves, depth, oldBoundaries);
     const parts: Buffer[] = [];
+    parts.push(pktLine('acknowledgments\n'));
     for (const line of ackLines(repo, haves)) parts.push(pktLine(line));
     const hasSections = plan.shallow.length > 0 || plan.unshallow.length > 0 || plan.objects.length > 0;
     if (hasSections) {

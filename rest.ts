@@ -97,9 +97,11 @@ function commitSummary(repo: Repo, sha: string): Record<string, unknown> {
   };
   const author = identity(parsed?.author ?? '');
   const committer = identity(parsed?.committer ?? '');
+  // GitHub's API presents the commit message without its trailing newline.
+  const message = (parsed?.message ?? '').replace(/\n$/, '');
   return {
     sha,
-    commit: { message: parsed?.message ?? '', author, committer },
+    commit: { message, author, committer },
     author: { login: VIEWER.login, id: VIEWER.id },
     committer: { login: VIEWER.login, id: VIEWER.id },
     parents: (parsed?.parents ?? []).map((parent) => ({ sha: parent })),
@@ -108,6 +110,9 @@ function commitSummary(repo: Repo, sha: string): Record<string, unknown> {
 
 export function handleRest(store: Store, req: RestRequest): RestResponse {
   const { method, segments, query } = req;
+  // The full request URL: pagination Link headers must point back at this
+  // route, not at the API root.
+  const requestUrl = segments.length ? `${req.baseUrl}/${segments.join('/')}` : req.baseUrl;
   if (req.bodyParseError && (method === 'POST' || method === 'PATCH' || method === 'PUT' || method === 'DELETE')) {
     return error(400, 'Invalid JSON in request body');
   }
@@ -152,7 +157,7 @@ export function handleRest(store: Store, req: RestRequest): RestResponse {
       }
       if (method === 'GET') {
         const repos = store.listReposFor(VIEWER.login);
-        const { page, headers } = paginate(repos.map((repo) => store.repoView(repo)), query, req.baseUrl);
+        const { page, headers } = paginate(repos.map((repo) => store.repoView(repo)), query, requestUrl);
         return json(200, page, headers);
       }
       return error(404, 'Not Found');
@@ -204,7 +209,7 @@ export function handleRest(store: Store, req: RestRequest): RestResponse {
       const ref = query.get('sha');
       const from = ref ? (isObjectId(ref) ? ref : store.refTip(repo, ref)) : store.headCommit(repo);
       const history = store.commitHistory(repo, from, 100).map((entry) => commitSummary(repo, entry.sha));
-      const { page, headers } = paginate(history, query, req.baseUrl);
+      const { page, headers } = paginate(history, query, requestUrl);
       return json(200, page, headers);
     }
 
@@ -355,7 +360,7 @@ export function handleRest(store: Store, req: RestRequest): RestResponse {
             if (byTime !== 0) return direction === 'asc' ? byTime : -byTime;
             return direction === 'asc' ? a.number - b.number : b.number - a.number;
           });
-          const { page, headers } = paginate(issues.map((issue) => store.issueView(issue, repo)), query, req.baseUrl);
+          const { page, headers } = paginate(issues.map((issue) => store.issueView(issue, repo)), query, requestUrl);
           return json(200, page, headers);
         }
         return error(404, 'Not Found');
@@ -414,7 +419,7 @@ export function handleRest(store: Store, req: RestRequest): RestResponse {
           if (state === 'open') pulls = pulls.filter((pull) => pull.state === 'open');
           else if (state === 'closed') pulls = pulls.filter((pull) => pull.state === 'closed');
           pulls.sort((a, b) => b.number - a.number);
-          const { page, headers } = paginate(pulls.map((pull) => store.pullView(pull, repo)), query, req.baseUrl);
+          const { page, headers } = paginate(pulls.map((pull) => store.pullView(pull, repo)), query, requestUrl);
           return json(200, page, headers);
         }
         return error(404, 'Not Found');

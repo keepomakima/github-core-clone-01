@@ -380,10 +380,15 @@ function page<T extends { number: number }>(
   items: readonly T[],
   first: unknown,
   after: unknown,
+  descending: boolean,
 ): { slice: T[]; hasNextPage: boolean; endCursor: string | null } {
   const afterNumber = cursorNumber(typeof after === 'string' ? after : null);
   let rest = items;
-  if (afterNumber !== null) rest = rest.filter((item) => item.number > afterNumber);
+  if (afterNumber !== null) {
+    // A cursor names the last item of the previous page; the next page holds
+    // the items after it in the page's own order.
+    rest = rest.filter((item) => (descending ? item.number < afterNumber : item.number > afterNumber));
+  }
   const limit = typeof first === 'number' && first > 0 ? first : rest.length;
   const slice = rest.slice(0, limit);
   const hasNextPage = rest.length > slice.length;
@@ -566,7 +571,7 @@ function resolveField(value: GqlValue, field: FieldNode, ctx: GqlContext): unkno
         }
         const direction = String(orderBy.direction ?? 'DESC');
         issues.sort((a, b) => (direction === 'ASC' ? a.number - b.number : b.number - a.number));
-        const result = page(issues, args.first, args.after);
+        const result = page(issues, args.first, args.after, direction !== 'ASC');
         return {
           __typename: 'IssueConnection',
           nodes: result.slice.map((issue) => issueValue(repo, issue)),
@@ -583,7 +588,7 @@ function resolveField(value: GqlValue, field: FieldNode, ctx: GqlContext): unkno
           pulls = pulls.filter((pull) => pull.state === 'open');
         }
         pulls.sort((a, b) => b.number - a.number);
-        const result = page(pulls, args.first, args.after);
+        const result = page(pulls, args.first, args.after, true);
         return {
           __typename: 'PullRequestConnection',
           nodes: result.slice.map((pull) => pullValue(repo, pull)),

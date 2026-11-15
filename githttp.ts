@@ -299,8 +299,8 @@ function v2UploadPack(repo: Repo, body: Buffer): { status: number; contentType: 
       else if (text.startsWith('ref-prefix ')) opts.prefixes.push(text.slice('ref-prefix '.length));
     }
     const key = `${repo.version}:ls-refs:${opts.peel}:${opts.symrefs}:${opts.unborn}:${opts.prefixes.join(',')}`;
-    const body = cachedResponse(repo, key, () => lsRefsResponse(repo, opts));
-    return { status: 200, contentType: 'application/x-git-upload-pack-result', body };
+    const responseBody = cachedResponse(repo, key, () => lsRefsResponse(repo, opts));
+    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: responseBody };
   }
   if (command === 'fetch') {
     const wants: string[] = [];
@@ -318,7 +318,7 @@ function v2UploadPack(repo: Repo, body: Buffer): { status: number; contentType: 
       }
     }
     const fetchKey = `${repo.version}:v2fetch:${wants.join(',')}|${haves.join(',')}|${depth ?? ''}|${oldBoundaries.join(',')}`;
-    const body = cachedResponse(repo, fetchKey, () => {
+    const responseBody = cachedResponse(repo, fetchKey, () => {
       const plan = planFetch(repo, wants, haves, depth, oldBoundaries);
       const parts: Buffer[] = [];
       parts.push(pktLine('acknowledgments\n'));
@@ -341,7 +341,7 @@ function v2UploadPack(repo: Repo, body: Buffer): { status: number; contentType: 
       parts.push(PKT_FLUSH);
       return Buffer.concat(parts);
     });
-    return { status: 200, contentType: 'application/x-git-upload-pack-result', body };
+    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: responseBody };
   }
   return { status: 400, contentType: 'application/json', body: Buffer.from(JSON.stringify({ message: 'unknown command' }), 'utf8') };
 }
@@ -378,7 +378,7 @@ function v0UploadPack(repo: Repo, body: Buffer): { status: number; contentType: 
     return { status: 400, contentType: 'application/json', body: Buffer.from(JSON.stringify({ message: 'bad request' }), 'utf8') };
   }
   const fetchKey = `${repo.version}:v0fetch:${wants.join(',')}|${haves.join(',')}|${depth ?? ''}|${oldBoundaries.join(',')}`;
-  const body = cachedResponse(repo, fetchKey, () => {
+  const responseBody = cachedResponse(repo, fetchKey, () => {
     const plan = planFetch(repo, wants, haves, depth, oldBoundaries);
     const parts: Buffer[] = [];
     for (const line of ackLines(repo, haves)) parts.push(pktLine(line));
@@ -391,7 +391,7 @@ function v0UploadPack(repo: Repo, body: Buffer): { status: number; contentType: 
     parts.push(PKT_FLUSH);
     return Buffer.concat(parts);
   });
-  return { status: 200, contentType: 'application/x-git-upload-pack-result', body };
+  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: responseBody };
 }
 
 export function handleUploadPack(

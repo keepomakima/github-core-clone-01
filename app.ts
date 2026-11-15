@@ -182,6 +182,15 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         res.end();
         return;
       }
+      if (result.rawJson !== undefined) {
+        res.writeHead(result.status, {
+          'content-type': 'application/json',
+          'x-github-request-id': nextRequestId(),
+          ...(result.headers ?? {}),
+        });
+        res.end(result.rawJson);
+        return;
+      }
       sendJson(res, result.status, result.body, result.headers);
       return;
     }

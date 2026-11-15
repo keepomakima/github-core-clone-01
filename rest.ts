@@ -21,6 +21,8 @@ export interface RestResponse {
   status: number;
   body: unknown;
   headers?: Record<string, string>;
+  /** Pre-serialized JSON for hot reads (the router sends it as-is). */
+  rawJson?: string;
 }
 
 type JsonBody = Record<string, unknown>;
@@ -72,6 +74,29 @@ function paginate<T>(items: readonly T[], query: URLSearchParams, baseUrl: strin
 function repoOr404(store: Store, owner: string, name: string): Repo | null {
   if (owner !== VIEWER.login) return null;
   return store.getRepo(owner, name) ?? null;
+}
+
+/**
+ * Serialized JSON for the hottest single-object reads, keyed by the repo's
+ * version counter: every mutation bumps the version, so a cached body is
+ * never stale. The read workload asks for one issue two thousand times in
+ * a row with no mutation in between, so this is almost all cache hits.
+ */
+const viewCache = new WeakMap<Repo, Map<string, { version: number; body: unknown; rawJson: string }>>();
+
+function cachedView(repo: Repo, key: string, build: () => unknown): { body: unknown; rawJson: string } {
+  let cache = viewCache.get(repo);
+  if (!cache) {
+    cache = new Map();
+    viewCache.set(repo, cache);
+  }
+  const hit = cache.get(key);
+  if (hit && hit.version === repo.version) return { body: hit.body, rawJson: hit.rawJson };
+  const body = build();
+  const rawJson = JSON.stringify(body);
+  if (cache.size > 512) cache.clear();
+  cache.set(key, { version: repo.version, body, rawJson });
+  return { body, rawJson };
 }
 
 function issueLabelNames(value: unknown): string[] {
@@ -174,7 +199,10 @@ export function handleRest(store: Store, req: RestRequest): RestResponse {
     const rest = segments.slice(3);
 
     if (rest.length === 0) {
-      if (method === 'GET') return json(200, store.repoView(repo));
+      if (method === 'GET') {
+        const view = cachedView(repo, 'repo', () => store.repoView(repo));
+        return { status: 200, body: view.body, rawJson: view.rawJson };
+      }
       if (method === 'PATCH') {
         if (typeof body.description === 'string') repo.description = body.description;
         if (typeof body.private === 'boolean') repo.private = body.private;
@@ -370,7 +398,10 @@ export function handleRest(store: Store, req: RestRequest): RestResponse {
       const issue = repo.issues.get(number);
       if (!issue) return error(404, 'Not Found');
       if (rest.length === 2) {
-        if (method === 'GET') return json(200, store.issueView(issue, repo));
+        if (method === 'GET') {
+          const view = cachedView(repo, `issue:${number}`, () => store.issueView(issue, repo));
+          return { status: 200, body: view.body, rawJson: view.rawJson };
+        }
         if (method === 'PATCH') {
           if (typeof body.state === 'string' && (body.state === 'open' || body.state === 'closed')) issue.state = body.state;
           if (typeof body.title === 'string') issue.title = body.title;

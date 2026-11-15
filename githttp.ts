@@ -8,7 +8,6 @@ import { parseCommit, parseTag, parseTree } from './gitobj.ts';
 import {
   PKT_FLUSH,
   ZERO_OID,
-  collectReachable,
   decodePktLines,
   isObjectId,
   pktLine,
@@ -140,12 +139,32 @@ function planFetch(
   for (const boundary of oldBoundaries) {
     if (includedCommits.has(boundary) && !shallow.includes(boundary)) unshallow.push(boundary);
   }
+  // Objects the client already holds. A have that is one of the client's
+  // shallow boundaries counts only for itself and its tree: a shallow clone
+  // holds the boundary commit but none of its parents, so the walk must not
+  // cross a boundary or a deepen would exclude the very parent it must send.
   const held = new Set<string>();
-  for (const have of haves) {
-    try {
-      for (const oid of collectReachable([have], lookup)) held.add(oid);
-    } catch {
-      // A have the server does not hold is simply ignored.
+  {
+    const stack: string[] = [...haves];
+    while (stack.length) {
+      const oid = stack.pop() as string;
+      if (held.has(oid)) continue;
+      const object = lookup(oid);
+      if (!object) continue;
+      held.add(oid);
+      if (object.type === 'commit') {
+        const commit = parseCommit(object.data);
+        stack.push(commit.tree);
+        if (!oldBoundaries.includes(oid)) {
+          for (const parent of commit.parents) stack.push(parent);
+        }
+      } else if (object.type === 'tag') {
+        stack.push(parseTag(object.data).object);
+      } else if (object.type === 'tree') {
+        for (const entry of parseTree(object.data)) {
+          if (entry.mode !== '160000') stack.push(entry.oid);
+        }
+      }
     }
   }
   // Walk the included commits without crossing the depth boundary: a commit

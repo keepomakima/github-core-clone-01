@@ -55,6 +55,28 @@ function readBody(req: IncomingMessage): Promise<{ raw: Buffer; parsed: unknown;
   });
 }
 
+function readRawBody(req: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', () => resolve(Buffer.alloc(0)));
+  });
+}
+
+// Route segments, cached per pathname: the bench hammers the same URLs
+// thousands of times and split + decodeURIComponent is pure per path.
+const SEGMENT_CACHE = new Map<string, string[]>();
+
+function routeSegments(pathname: string): string[] {
+  const hit = SEGMENT_CACHE.get(pathname);
+  if (hit) return hit;
+  const segments = pathname.split('/').filter(Boolean).map(decodeSegment);
+  if (SEGMENT_CACHE.size > 512) SEGMENT_CACHE.clear();
+  SEGMENT_CACHE.set(pathname, segments);
+  return segments;
+}
+
 function bearerToken(req: IncomingMessage): string {
   const header = req.headers.authorization ?? '';
   return header.startsWith('Bearer ') ? header.slice(7) : '';
@@ -75,21 +97,50 @@ function decodeSegment(segment: string): string {
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const method = req.method ?? 'GET';
   const host = req.headers.host ?? 'localhost';
   const baseUrl = `http://${host}`;
-  const segments = url.pathname.split('/').filter(Boolean).map(decodeSegment);
+  const rawUrl = req.url ?? '/';
+  // Fast path: split the raw path without building a URL object. Fall back
+  // to `new URL` for exotic paths (backslash, dot segments, doubled slashes),
+  // where WHATWG normalization could change the pathname.
+  const qIndex = rawUrl.indexOf('?');
+  const rawPath = qIndex < 0 ? rawUrl : rawUrl.slice(0, qIndex);
+  const queryString = qIndex < 0 ? '' : rawUrl.slice(qIndex + 1);
+  const exotic =
+    rawPath.includes('\\') ||
+    rawPath.includes('//') ||
+    rawPath.includes('/./') ||
+    rawPath.includes('/../') ||
+    rawPath.endsWith('/.') ||
+    rawPath.endsWith('/..');
+  let pathname: string;
+  let searchParams: URLSearchParams | null = null;
+  if (exotic) {
+    const url = new URL(rawUrl, baseUrl);
+    pathname = url.pathname;
+    searchParams = url.searchParams;
+  } else {
+    pathname = rawPath;
+  }
+  // The query string is parsed lazily: the hottest route (GET one issue) has
+  // no query at all, and most routes never touch it.
+  const getQuery = (): URLSearchParams => (searchParams ??= new URLSearchParams(queryString));
+  const segments = routeSegments(pathname);
+  // GET/HEAD never carry a body in this API: skip waiting for 'end' (one
+  // event-loop turn per request) on the hottest paths.
+  const needsBody = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
+  const emptyBody = { raw: Buffer.alloc(0), parsed: null, parseError: false };
 
   try {
     // ---- health ---------------------------------------------------------------------------
-    if (url.pathname === '/healthz' && method === 'GET') {
+    if (pathname === '/healthz' && method === 'GET') {
       sendJson(res, 200, { ok: true });
       return;
     }
 
     // ---- git smart HTTP -------------------------------------------------------------------
-    const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(url.pathname);
+    const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(pathname);
     if (gitMatch) {
       const owner = decodeSegment(gitMatch[1] as string);
       const repoName = decodeSegment(gitMatch[2] as string);
@@ -106,19 +157,19 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const protocol = req.headers['git-protocol'] ?? null;
       const version2 = typeof protocol === 'string' && protocol.includes('version=2') ? '2' : null;
       if (action === 'info/refs' && method === 'GET') {
-        const service = url.searchParams.get('service') ?? '';
+        const service = getQuery().get('service') ?? '';
         const result = handleInfoRefs(repo, service, version2);
         sendBytes(res, result.status, result.contentType, result.body);
         return;
       }
       if (action === 'git-upload-pack' && method === 'POST') {
-        const { raw } = await readBody(req);
+        const raw = await readRawBody(req);
         const result = handleUploadPack(repo, raw, version2);
         sendBytes(res, result.status, result.contentType, result.body);
         return;
       }
       if (action === 'git-receive-pack' && method === 'POST') {
-        const { raw } = await readBody(req);
+        const raw = await readRawBody(req);
         const result = handleReceivePack(store, repo, raw);
         sendBytes(res, result.status, result.contentType, result.body);
         return;
@@ -128,12 +179,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
 
     // ---- GraphQL v4 -----------------------------------------------------------------------
-    if (url.pathname === '/api/graphql' && method === 'POST') {
+    if (pathname === '/api/graphql' && method === 'POST') {
       if (!authorized(req)) {
         sendJson(res, 401, { message: 'Requires authentication' });
         return;
       }
-      const { parsed, parseError } = await readBody(req);
+      const { parsed, parseError } = needsBody ? await readBody(req) : emptyBody;
       if (parseError) {
         sendJson(res, 400, { errors: [{ message: 'Invalid JSON in request body' }] });
         return;
@@ -144,12 +195,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
 
     // ---- MCP ------------------------------------------------------------------------------
-    if (url.pathname === '/mcp' && method === 'POST') {
+    if (pathname === '/mcp' && method === 'POST') {
       if (!authorized(req)) {
         sendJson(res, 401, { message: 'Requires authentication' });
         return;
       }
-      const { parsed, parseError } = await readBody(req);
+      const { parsed, parseError } = needsBody ? await readBody(req) : emptyBody;
       const result = handleMcp(store, parsed, parseError);
       if (result.body === null) {
         res.writeHead(result.status, { 'x-github-request-id': nextRequestId() });
@@ -167,11 +218,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sendJson(res, 401, { message: 'Requires authentication' });
         return;
       }
-      const { parsed, parseError } = await readBody(req);
+      const { parsed, parseError } = needsBody ? await readBody(req) : emptyBody;
       const restReq: RestRequest = {
         method,
         segments: segments.slice(2),
-        query: url.searchParams,
+        get query() {
+          return getQuery();
+        },
         body: parsed,
         bodyParseError: parseError,
         baseUrl: `${baseUrl}/api/v3`,

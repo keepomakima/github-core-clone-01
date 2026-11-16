@@ -111,6 +111,35 @@ export interface TreeEntry {
   readonly oid: string;
 }
 
+// Parsed-commit/tree caches: a git object is immutable once stored, so a
+// parse is pure per data Buffer. planFetch, the reachability walks and the
+// REST surface parse the same commits/trees several times per request; the
+// cache turns every repeat into a lookup. Keyed by the object's own data
+// Buffer (WeakMap: an entry dies with its object). Callers only read the
+// parsed views, never mutate them, so sharing one parsed object is safe.
+const commitParseCache = new WeakMap<Buffer, CommitView>();
+const treeParseCache = new WeakMap<Buffer, TreeEntry[]>();
+
+export function cachedParseCommit(data: Uint8Array): CommitView {
+  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  let hit = commitParseCache.get(buffer);
+  if (hit === undefined) {
+    hit = parseCommit(buffer);
+    commitParseCache.set(buffer, hit);
+  }
+  return hit;
+}
+
+export function cachedParseTree(data: Uint8Array): TreeEntry[] {
+  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  let hit = treeParseCache.get(buffer);
+  if (hit === undefined) {
+    hit = parseTree(buffer);
+    treeParseCache.set(buffer, hit);
+  }
+  return hit;
+}
+
 export function parseTree(data: Uint8Array): TreeEntry[] {
   const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const entries: TreeEntry[] = [];
@@ -472,13 +501,13 @@ export function collectReachable(roots: Iterable<string>, lookup: ObjectLookup):
     if (!object) throw new Error(`object ${oid} is missing from the store`);
     seen.add(oid);
     if (object.type === 'commit') {
-      const commit = parseCommit(object.data);
+      const commit = cachedParseCommit(object.data);
       queue.push(commit.tree);
       for (const parent of commit.parents) queue.push(parent);
     } else if (object.type === 'tag') {
       queue.push(parseTag(object.data).object);
     } else if (object.type === 'tree') {
-      for (const entry of parseTree(object.data)) {
+      for (const entry of cachedParseTree(object.data)) {
         if (entry.mode !== '160000') queue.push(entry.oid);
       }
     }
@@ -496,7 +525,7 @@ export function isAncestor(ancestor: string, tip: string, lookup: ObjectLookup):
     const object = lookup(oid);
     if (!object) continue;
     if (object.type === 'commit') {
-      for (const parent of parseCommit(object.data).parents) {
+      for (const parent of cachedParseCommit(object.data).parents) {
         if (parent === ancestor) return true;
         if (!seen.has(parent)) {
           seen.add(parent);
@@ -529,7 +558,7 @@ export function mergeBase(a: string, b: string, lookup: ObjectLookup): string | 
       seen.add(oid);
       const object = lookup(oid);
       if (object?.type === 'commit') {
-        for (const parent of parseCommit(object.data).parents) queue.push(parent);
+        for (const parent of cachedParseCommit(object.data).parents) queue.push(parent);
       }
     }
     return seen;
@@ -544,7 +573,7 @@ export function mergeBase(a: string, b: string, lookup: ObjectLookup): string | 
     if (setA.has(oid)) return oid;
     const object = lookup(oid);
     if (object?.type === 'commit') {
-      for (const parent of parseCommit(object.data).parents) queue.push(parent);
+      for (const parent of cachedParseCommit(object.data).parents) queue.push(parent);
     }
   }
   return null;

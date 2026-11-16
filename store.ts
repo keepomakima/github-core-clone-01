@@ -9,6 +9,8 @@ import {
   ZERO_OID,
   buildCommit,
   buildTree,
+  cachedParseCommit,
+  cachedParseTree,
   collectReachable,
   hashObject,
   isAncestor,
@@ -92,6 +94,9 @@ export interface Repo {
   /** Flat path -> blob oid of the default branch tip (rebuilt on commit). */
   filesCache: Map<string, string> | null;
   filesCacheCommit: string | null;
+  /** Path -> tree oid of every directory at the tip (cached per commit). */
+  treeOidsCache: Map<string, string> | null;
+  treeOidsCacheCommit: string | null;
 }
 
 export class Store {
@@ -159,6 +164,8 @@ export class Store {
       version: 1,
       filesCache: null,
       filesCacheCommit: null,
+      treeOidsCache: null,
+      treeOidsCacheCommit: null,
     };
     this.repos.set(this.repoKey(owner, name), repo);
     return repo;
@@ -212,36 +219,40 @@ export class Store {
       const walk = (treeOid: string, prefix: string): void => {
         const tree = repo.objects.get(treeOid);
         if (tree?.type !== 'tree') return;
-        for (const entry of parseTree(tree.data)) {
+        for (const entry of cachedParseTree(tree.data)) {
           const path = prefix ? `${prefix}/${entry.name}` : entry.name;
           if (entry.mode === '40000') walk(entry.oid, path);
           else if (entry.mode !== '160000') out.set(path, entry.oid);
         }
       };
-      walk(parseCommit(root.data).tree, '');
+      walk(cachedParseCommit(root.data).tree, '');
     }
     repo.filesCache = out;
     repo.filesCacheCommit = commitOid;
     return out;
   }
 
-  /** Path -> tree oid of every directory in the tree at `commitOid`. */
+  /** Path -> tree oid of every directory in the tree at `commitOid` (cached per commit). */
   treeOidsOfCommit(repo: Repo, commitOid: string): Map<string, string> {
+    if (repo.treeOidsCacheCommit === commitOid && repo.treeOidsCache) return repo.treeOidsCache;
     const out = new Map<string, string>();
     const root = repo.objects.get(commitOid);
-    if (root?.type !== 'commit') return out;
-    const walk = (treeOid: string, prefix: string): void => {
-      const tree = repo.objects.get(treeOid);
-      if (tree?.type !== 'tree') return;
-      for (const entry of parseTree(tree.data)) {
-        if (entry.mode === '40000') {
-          const path = prefix ? `${prefix}/${entry.name}` : entry.name;
-          out.set(path, entry.oid);
-          walk(entry.oid, path);
+    if (root?.type === 'commit') {
+      const walk = (treeOid: string, prefix: string): void => {
+        const tree = repo.objects.get(treeOid);
+        if (tree?.type !== 'tree') return;
+        for (const entry of cachedParseTree(tree.data)) {
+          if (entry.mode === '40000') {
+            const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+            out.set(path, entry.oid);
+            walk(entry.oid, path);
+          }
         }
-      }
-    };
-    walk(parseCommit(root.data).tree, '');
+      };
+      walk(cachedParseCommit(root.data).tree, '');
+    }
+    repo.treeOidsCache = out;
+    repo.treeOidsCacheCommit = commitOid;
     return out;
   }
 
@@ -503,13 +514,15 @@ export class Store {
     if (!fromSha) return out;
     const seen = new Set<string>();
     const queue: { sha: string; depth: number }[] = [{ sha: fromSha, depth: 0 }];
-    while (queue.length && out.length < limit) {
-      const { sha } = queue.shift() as { sha: string; depth: number };
+    // Index pointer, not shift(): shift() is O(n) per pop.
+    let queueHead = 0;
+    while (queueHead < queue.length && out.length < limit) {
+      const { sha } = queue[queueHead++] as { sha: string; depth: number };
       if (seen.has(sha)) continue;
       seen.add(sha);
       const object = repo.objects.get(sha);
       if (object?.type !== 'commit') continue;
-      const parsed = parseCommit(object.data);
+      const parsed = cachedParseCommit(object.data);
       out.push({ sha, message: parsed.message, author: parsed.author, committer: parsed.committer });
       for (const parent of parsed.parents) queue.push({ sha: parent, depth: 0 });
     }

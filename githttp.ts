@@ -4,7 +4,7 @@
 // advertisement, ls-refs/fetch commands, shallow/deepen handling, sideband
 // packfiles, report-status. Standard library only.
 
-import { parseCommit, parseTag, parseTree } from './gitobj.ts';
+import { cachedParseCommit, cachedParseTree, parseTag } from './gitobj.ts';
 import {
   PKT_FLUSH,
   ZERO_OID,
@@ -124,6 +124,9 @@ function planFetch(
   const lookup = (oid: string): GitObject | undefined => repo.objects.get(oid);
   const distance = new Map<string, number>();
   const queue: { oid: string; depth: number }[] = [];
+  // Index pointer, not shift(): the queue is a FIFO and shift() is O(n) per
+  // pop, which made a 200-commit fetch walk quadratic.
+  let queueHead = 0;
   for (const want of wants) {
     const object = lookup(want);
     if (!object) continue;
@@ -135,8 +138,8 @@ function planFetch(
     }
   }
   const includedCommits = new Set<string>();
-  while (queue.length) {
-    const { oid, depth: d } = queue.shift() as { oid: string; depth: number };
+  while (queueHead < queue.length) {
+    const { oid, depth: d } = queue[queueHead++] as { oid: string; depth: number };
     if (distance.has(oid)) continue;
     const object = lookup(oid);
     if (!object) continue;
@@ -144,21 +147,23 @@ function planFetch(
     if (depth !== null && d >= depth) continue;
     includedCommits.add(oid);
     if (object.type === 'commit') {
-      for (const parent of parseCommit(object.data).parents) queue.push({ oid: parent, depth: d + 1 });
+      for (const parent of cachedParseCommit(object.data).parents) queue.push({ oid: parent, depth: d + 1 });
     }
   }
   const shallow: string[] = [];
   if (depth !== null) {
     for (const [oid, d] of distance) if (d === depth - 1 && includedCommits.has(oid)) shallow.push(oid);
   }
+  const shallowSet = new Set(shallow);
   const unshallow: string[] = [];
   for (const boundary of oldBoundaries) {
-    if (includedCommits.has(boundary) && !shallow.includes(boundary)) unshallow.push(boundary);
+    if (includedCommits.has(boundary) && !shallowSet.has(boundary)) unshallow.push(boundary);
   }
   // Objects the client already holds. A have that is one of the client's
   // shallow boundaries counts only for itself and its tree: a shallow clone
   // holds the boundary commit but none of its parents, so the walk must not
   // cross a boundary or a deepen would exclude the very parent it must send.
+  const oldBoundarySet = new Set(oldBoundaries);
   const held = new Set<string>();
   {
     const stack: string[] = [...haves];
@@ -169,15 +174,15 @@ function planFetch(
       if (!object) continue;
       held.add(oid);
       if (object.type === 'commit') {
-        const commit = parseCommit(object.data);
+        const commit = cachedParseCommit(object.data);
         stack.push(commit.tree);
-        if (!oldBoundaries.includes(oid)) {
+        if (!oldBoundarySet.has(oid)) {
           for (const parent of commit.parents) stack.push(parent);
         }
       } else if (object.type === 'tag') {
         stack.push(parseTag(object.data).object);
       } else if (object.type === 'tree') {
-        for (const entry of parseTree(object.data)) {
+        for (const entry of cachedParseTree(object.data)) {
           if (entry.mode !== '160000') stack.push(entry.oid);
         }
       }
@@ -195,13 +200,13 @@ function planFetch(
     if (!object) continue;
     wanted.add(oid);
     if (object.type === 'commit') {
-      const commit = parseCommit(object.data);
+      const commit = cachedParseCommit(object.data);
       stack.push(commit.tree);
       for (const parent of commit.parents) if (includedCommits.has(parent)) stack.push(parent);
     } else if (object.type === 'tag') {
       stack.push(parseTag(object.data).object);
     } else if (object.type === 'tree') {
-      for (const entry of parseTree(object.data)) {
+      for (const entry of cachedParseTree(object.data)) {
         if (entry.mode !== '160000') stack.push(entry.oid);
       }
     }
@@ -258,14 +263,15 @@ function lsRefsResponse(
   const lines: string[] = [];
   const head = repo.refs.get(`refs/heads/${repo.default_branch}`) ?? null;
   const matchPrefix = (name: string): boolean => opts.prefixes.length === 0 || opts.prefixes.some((p) => name.startsWith(p));
-  if (sortedRefs(repo).length === 0) {
+  const refs = sortedRefs(repo);
+  if (refs.length === 0) {
     if (opts.unborn) lines.push('unborn HEAD symref-target:refs/heads/main');
     return pktLines([...lines, 'flush']);
   }
   if (matchPrefix('HEAD') && head) {
     lines.push(opts.symrefs ? `${head} HEAD symref-target:refs/heads/main` : `${head} HEAD`);
   }
-  for (const ref of sortedRefs(repo)) {
+  for (const ref of refs) {
     if (!matchPrefix(ref.name)) continue;
     let line = `${ref.oid} ${ref.name}`;
     if (opts.peel) {

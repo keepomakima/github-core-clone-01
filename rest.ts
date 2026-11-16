@@ -5,7 +5,7 @@
 // repos, 409 on stale content shas, 405 on conflicted merges.
 
 import { VIEWER } from './scenario.ts';
-import { isObjectId, parseCommit } from './gitobj.ts';
+import { cachedParseCommit, isObjectId } from './gitobj.ts';
 import type { Repo, Store } from './store.ts';
 
 export interface RestRequest {
@@ -22,7 +22,7 @@ export interface RestResponse {
   body: unknown;
   headers?: Record<string, string>;
   /** Pre-serialized JSON for hot reads (the router sends it as-is). */
-  rawJson?: string;
+  rawJson?: Buffer;
 }
 
 type JsonBody = Record<string, unknown>;
@@ -82,9 +82,9 @@ function repoOr404(store: Store, owner: string, name: string): Repo | null {
  * never stale. The read workload asks for one issue two thousand times in
  * a row with no mutation in between, so this is almost all cache hits.
  */
-const viewCache = new WeakMap<Repo, Map<string, { version: number; body: unknown; rawJson: string }>>();
+const viewCache = new WeakMap<Repo, Map<string, { version: number; body: unknown; rawJson: Buffer }>>();
 
-function cachedView(repo: Repo, key: string, build: () => unknown): { body: unknown; rawJson: string } {
+function cachedView(repo: Repo, key: string, build: () => unknown): { body: unknown; rawJson: Buffer } {
   let cache = viewCache.get(repo);
   if (!cache) {
     cache = new Map();
@@ -93,7 +93,7 @@ function cachedView(repo: Repo, key: string, build: () => unknown): { body: unkn
   const hit = cache.get(key);
   if (hit && hit.version === repo.version) return { body: hit.body, rawJson: hit.rawJson };
   const body = build();
-  const rawJson = JSON.stringify(body);
+  const rawJson = Buffer.from(JSON.stringify(body), 'utf8');
   if (cache.size > 512) cache.clear();
   cache.set(key, { version: repo.version, body, rawJson });
   return { body, rawJson };
@@ -114,7 +114,7 @@ function issueLabelNames(value: unknown): string[] {
 
 function commitSummary(repo: Repo, sha: string): Record<string, unknown> {
   const object = repo.objects.get(sha);
-  const parsed = object?.type === 'commit' ? parseCommit(object.data) : null;
+  const parsed = object?.type === 'commit' ? cachedParseCommit(object.data) : null;
   const identity = (raw: string): { name: string; email: string; date: string } => {
     const match = /^(.*?) <([^>]*)> (\d+) [+-]\d{4}$/.exec(raw);
     if (!match) return { name: raw, email: '', date: '' };
@@ -300,7 +300,7 @@ export function handleRest(store: Store, req: RestRequest): RestResponse {
           }
         }
         if (entries.length === 0) return error(404, 'Not Found');
-        entries.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+        entries.sort((a, b) => (String(a.name) < String(b.name) ? -1 : String(a.name) > String(b.name) ? 1 : 0));
         return json(200, entries);
       }
       if (method === 'PUT') {
@@ -384,7 +384,7 @@ export function handleRest(store: Store, req: RestRequest): RestResponse {
           else if (state === 'closed') issues = issues.filter((issue) => issue.state === 'closed');
           const key = sort === 'updated' ? 'updated_at' : 'created_at';
           issues.sort((a, b) => {
-            const byTime = a[key].localeCompare(b[key]);
+            const byTime = a[key] < b[key] ? -1 : a[key] > b[key] ? 1 : 0;
             if (byTime !== 0) return direction === 'asc' ? byTime : -byTime;
             return direction === 'asc' ? a.number - b.number : b.number - a.number;
           });

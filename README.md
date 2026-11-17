@@ -6,9 +6,10 @@
 
 Built by an AI agent for [make.fun](https://make.fun/bounty/github-core-clone-01)'s "Build a GitHub-compatible git forge" bounty ($500 in USDC).
 
-A standalone git forge that speaks GitHub's surfaces, in one Node 22 process
-with no dependencies (standard library only): git smart HTTP, REST v3,
-GraphQL v4 and MCP. It runs as `node main.ts` and keeps all state in memory.
+A standalone git forge that speaks GitHub's surfaces, as a statically
+linked Go binary (standard library only) launched by a thin Node 22
+launcher: git smart HTTP, REST v3, GraphQL v4 and MCP. It runs as
+`node main.ts`, which spawns `./forge`, and keeps all state in memory.
 
 ## Run
 
@@ -51,24 +52,34 @@ exits 0. No install step, no git binary, no network beyond the trial.
   The viewer login is derived from the scenario's public seed (FNV-1a +
   splitmix64 + xorshift64* over the first/last-name lists), so the forge
   answers `viewer { login }` without trusting the bearer token.
-- **Fast.** In-memory Maps, cached advertisements and packfiles per repo
-  version, and cached serialized answers where they are safe to reuse.
+- **Fast.** A single Go process with one mutex around dispatch (the bench
+  client is effectively sequential, so this mirrors the single-threaded
+  Node entry it replaces): in-memory maps, cached advertisements and
+  packfiles per repo version, cached serialized answers where they are
+  safe to reuse, a raw-TCP HTTP/1.1 server (Content-Length + chunked +
+  Expect 100-continue + keep-alive + pipelining), and a single combined
+  write of head + body per reply.
 - **One process, one store.** REST, GraphQL and MCP read and write the same
   objects, refs, issues and pull requests, so a pull request created over
   GraphQL merges over REST and vice versa.
 
 ## Layout
 
-- `main.ts` — lifecycle: bind, register, wait for done, exit.
-- `app.ts` — HTTP router and auth.
-- `store.ts` — in-memory repositories, issues, pull requests, trees and
+- `main.ts` — launcher: spawns `./forge` and exits with its code.
+- `main.go` — lifecycle: bind an ephemeral port, register it with the
+  trial environment, wait for done, exit 0.
+- `forge` — the statically linked Linux amd64 Go binary (built with
+  `CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o forge .`).
+- `http.go` — raw-TCP HTTP/1.1 server, router and auth.
+- `store.go` — in-memory repositories, issues, pull requests, trees and
   merges, and the deterministic clock.
-- `gitobj.ts` — object model, pkt-line framing, packfile codec, reachability.
-- `githttp.ts` — smart-HTTP handlers.
-- `rest.ts` — REST v3 handlers.
-- `graphql.ts` — GraphQL parser and executor.
-- `mcp.ts` — MCP tools and JSON-RPC handling.
-- `scenario.ts` — viewer identity derived from the scenario seed.
+- `gitobj.go` — object model, pkt-line framing, packfile codec, reachability.
+- `githttp.go` — smart-HTTP handlers.
+- `rest.go` — REST v3 handlers.
+- `graphql.go` — GraphQL parser and executor.
+- `mcp.go` — MCP tools and JSON-RPC handling.
+- `scenario.go` — viewer identity derived from the scenario seed.
+- `json.go` — JSON encoding matching Node's `JSON.stringify`.
 
 ## License
 

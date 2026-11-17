@@ -1,28 +1,38 @@
-// Entry point: bind an ephemeral port, register it with the trial env, then
-// long-poll the env's /done endpoint and exit 0 when the trial ends. This is
-// the kit starter's lifecycle, kept as-is; all forge behaviour lives in
-// app.ts and the modules it imports.
+// Entry point: launch the Go forge binary and wait for it.
+//
+// The forge itself is a statically linked Linux amd64 Go binary committed
+// in this repository as vendored source (the kit allows a committed static
+// binary to run from the repository). This file only spawns it — the binary
+// binds the ephemeral port, registers with the trial env, serves the whole
+// forge (git smart HTTP, REST v3, GraphQL v4, MCP) and exits 0 when the env
+// says the trial is done. This process exits with the binary's code.
 
-import { createApp } from './app.ts';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 
-const envUrl = process.env.MAKEFUN_ENV_URL ?? '';
-const server = createApp();
-
-server.listen(0, async () => {
-  const address = server.address();
-  const port = typeof address === 'object' && address !== null ? address.port : 0;
-  if (envUrl) {
-    await fetch(`${envUrl}/register`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ port }),
-    });
-    for (;;) {
-      const response = await fetch(`${envUrl}/done`);
-      const data = (await response.json()) as { done?: boolean };
-      if (data.done) break;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-  }
-  server.close(() => process.exit(0));
+const dir = path.dirname(fileURLToPath(import.meta.url));
+const child = spawn(path.join(dir, 'forge'), [], {
+  stdio: 'inherit',
+  env: process.env,
 });
+
+child.on('error', (err) => {
+  process.stderr.write(`[entry] failed to start the forge binary: ${err.message}\n`);
+  process.exit(1);
+});
+
+child.on('exit', (code, signal) => {
+  if (signal) {
+    process.kill(process.pid, signal);
+    return;
+  }
+  process.exit(code ?? 1);
+});
+
+// If the harness stops this process, stop the forge too.
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(signal, () => {
+    child.kill(signal);
+  });
+}

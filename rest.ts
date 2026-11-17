@@ -48,19 +48,21 @@ function asNumber(value: unknown, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function paginate<T>(items: readonly T[], query: URLSearchParams, baseUrl: string): { page: T[]; headers: Record<string, string> } {
+function paginate<T>(items: readonly T[], query: URLSearchParams, baseUrl: string | (() => string)): { page: T[]; headers: Record<string, string> } {
   const perPage = Math.min(100, asNumber(query.get('per_page'), 30));
   const page = Math.max(1, asNumber(query.get('page'), 1));
   const totalPages = Math.max(1, Math.ceil(items.length / perPage));
   const slice = items.slice((page - 1) * perPage, page * perPage);
   const headers: Record<string, string> = {};
   if (totalPages > 1) {
+    // The base URL string is only needed when a Link header is actually built.
+    const base = typeof baseUrl === 'function' ? baseUrl() : baseUrl;
     const links: string[] = [];
     const urlFor = (target: number): string => {
       const params = new URLSearchParams(query);
       params.set('page', String(target));
       params.set('per_page', String(perPage));
-      return `${baseUrl}?${params.toString()}`;
+      return `${base}?${params.toString()}`;
     };
     if (page < totalPages) links.push(`<${urlFor(page + 1)}>; rel="next"`);
     links.push(`<${urlFor(totalPages)}>; rel="last"`);
@@ -136,8 +138,9 @@ function commitSummary(repo: Repo, sha: string): Record<string, unknown> {
 export function handleRest(store: Store, req: RestRequest): RestResponse {
   const { method, segments, query } = req;
   // The full request URL: pagination Link headers must point back at this
-  // route, not at the API root.
-  const requestUrl = segments.length ? `${req.baseUrl}/${segments.join('/')}` : req.baseUrl;
+  // route, not at the API root. Built lazily — paginate only needs it when
+  // there is more than one page, which the hot paths never have.
+  const requestUrl = () => (segments.length ? `${req.baseUrl}/${segments.join('/')}` : req.baseUrl);
   if (req.bodyParseError && (method === 'POST' || method === 'PATCH' || method === 'PUT' || method === 'DELETE')) {
     return error(400, 'Invalid JSON in request body');
   }

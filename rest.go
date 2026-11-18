@@ -163,6 +163,95 @@ func cachedView(r *repo, key string, build func() any) (body any, rawJSON []byte
 	return body, rawJSON
 }
 
+// appendJSONString appends s as a JSON string literal, matching
+// encoding/json with SetEscapeHTML(false): escapes ", \, control chars and
+// U+2028/U+2029; all other bytes (including UTF-8) pass through unchanged.
+func appendJSONString(dst []byte, s string) []byte {
+	dst = append(dst, '"')
+	start := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c == '"' || c == '\\' {
+			dst = append(dst, s[start:i]...)
+			switch c {
+			case '"':
+				dst = append(dst, '\\', '"')
+			case '\\':
+				dst = append(dst, '\\', '\\')
+			case '\n':
+				dst = append(dst, '\\', 'n')
+			case '\r':
+				dst = append(dst, '\\', 'r')
+			case '\t':
+				dst = append(dst, '\\', 't')
+			default:
+				dst = append(dst, '\\', 'u', '0', '0', hexDigits[c>>4], hexDigits[c&0xf])
+			}
+			start = i + 1
+		} else if c == 0xE2 && i+2 < len(s) && s[i+1] == 0x80 && (s[i+2] == 0xA8 || s[i+2] == 0xA9) {
+			dst = append(dst, s[start:i]...)
+			if s[i+2] == 0xA8 {
+				dst = append(dst, '\\', 'u', '2', '0', '2', '8')
+			} else {
+				dst = append(dst, '\\', 'u', '2', '0', '2', '9')
+			}
+			i += 2
+			start = i + 1
+		}
+	}
+	dst = append(dst, s[start:]...)
+	dst = append(dst, '"')
+	return dst
+}
+
+// issueJSON builds the create-issue 201 response byte-identical to
+// marshalJSON(issueView): keys in encoding/json's sorted order. The write
+// workload POSTs 200 issues a round, and map building + reflection marshal
+// was ~6µs of its ~16µs server cost.
+func issueJSON(iss *issue, r *repo) []byte {
+	out := make([]byte, 0, 512)
+	out = append(out, '{')
+	out = append(out, `"body":`...)
+	out = appendJSONString(out, iss.body)
+	out = append(out, `,"comments":`...)
+	out = strconv.AppendInt(out, int64(len(iss.comments)), 10)
+	out = append(out, `,"created_at":`...)
+	out = appendJSONString(out, iss.createdAt)
+	out = append(out, `,"id":`...)
+	out = strconv.AppendInt(out, int64(iss.id), 10)
+	out = append(out, `,"labels":[`...)
+	for i, l := range iss.labels {
+		if i > 0 {
+			out = append(out, ',')
+		}
+		out = append(out, `{"color":`...)
+		out = appendJSONString(out, l.color)
+		out = append(out, `,"name":`...)
+		out = appendJSONString(out, l.name)
+		out = append(out, '}')
+	}
+	out = append(out, `],"number":`...)
+	out = strconv.AppendInt(out, int64(iss.number), 10)
+	out = append(out, `,"repository":{"full_name":`...)
+	out = appendJSONString(out, r.owner+"/"+r.name)
+	out = append(out, `,"id":`...)
+	out = strconv.AppendInt(out, int64(r.id), 10)
+	out = append(out, `,"name":`...)
+	out = appendJSONString(out, r.name)
+	out = append(out, `},"state":`...)
+	out = appendJSONString(out, iss.state)
+	out = append(out, `,"title":`...)
+	out = appendJSONString(out, iss.title)
+	out = append(out, `,"updated_at":`...)
+	out = appendJSONString(out, iss.updatedAt)
+	out = append(out, `,"user":{"id":`...)
+	out = strconv.AppendInt(out, int64(iss.user.id), 10)
+	out = append(out, `,"login":`...)
+	out = appendJSONString(out, iss.user.login)
+	out = append(out, `}}`...)
+	return out
+}
+
 func issueLabelNames(value any) []string {
 	arr, ok := value.([]any)
 	if !ok {
@@ -618,7 +707,7 @@ func handleRest(s *store, req restRequest) restResponse {
 					if err != nil {
 						return restError(422, err.Error())
 					}
-					return restJSON(201, s.issueView(iss, repo), nil)
+					return restResponse{status: 201, rawJSON: issueJSON(iss, repo)}
 				}
 				if method == "GET" {
 					q := query()

@@ -307,20 +307,29 @@ func planFetch(r *repo, wants, haves []string, depth *int, depthRelative bool, o
 			}
 		}
 	}
-	var objects []*gitObject
+	// Deterministic pack order (the TS version used Set insertion order; the
+	// client reads objects by oid, so order is free — sort for stability).
+	// The wanted map is already keyed by oid, so sort by the key directly
+	// instead of re-hashing every object per comparison (the old code did
+	// O(n log n) SHA-1 hashes here).
+	type oidObject struct {
+		oid string
+		obj *gitObject
+	}
+	paired := make([]oidObject, 0, len(wanted))
 	for oid := range wanted {
 		if held[oid] {
 			continue
 		}
 		if object := lookup(oid); object != nil {
-			objects = append(objects, object)
+			paired = append(paired, oidObject{oid: oid, obj: object})
 		}
 	}
-	// Deterministic pack order (the TS version used Set insertion order; the
-	// client reads objects by oid, so order is free — sort for stability).
-	sort.Slice(objects, func(i, j int) bool {
-		return hashObject(objects[i].typ, objects[i].data) < hashObject(objects[j].typ, objects[j].data)
-	})
+	sort.Slice(paired, func(i, j int) bool { return paired[i].oid < paired[j].oid })
+	objects := make([]*gitObject, 0, len(paired))
+	for _, p := range paired {
+		objects = append(objects, p.obj)
+	}
 	sort.Strings(shallow)
 	sort.Strings(unshallow)
 	return fetchPlan{objects: objects, shallow: shallow, unshallow: unshallow}

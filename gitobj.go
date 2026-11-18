@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
+	"sync"
 )
 
 const zeroOID = "0000000000000000000000000000000000000000"
@@ -51,19 +53,33 @@ func isObjectID(value string) bool {
 }
 
 func hashObject(typ gitObjectType, data []byte) string {
+	// Header "type len\0" built on the stack: no fmt.Sprintf allocation.
+	var hdr [24]byte
+	n := copy(hdr[:], string(typ))
+	hdr[n] = ' '
+	n++
+	n = len(strconv.AppendInt(hdr[:n], int64(len(data)), 10))
+	hdr[n] = 0
+	n++
 	h := sha1.New()
-	h.Write([]byte(fmt.Sprintf("%s %d\x00", typ, len(data))))
+	h.Write(hdr[:n])
 	h.Write(data)
-	return hex.EncodeToString(h.Sum(nil))
+	sum := h.Sum(nil)
+	var hexbuf [40]byte
+	hex.Encode(hexbuf[:], sum)
+	return string(hexbuf[:])
 }
 
 // ---------------------------------------------------------------------------------------------
 // pkt-line
 // ---------------------------------------------------------------------------------------------
 
+const hexDigits = "0123456789abcdef"
+
 func pktLine(payload []byte) []byte {
+	n := len(payload) + 4
 	out := make([]byte, 0, len(payload)+4)
-	out = append(out, []byte(fmt.Sprintf("%04x", len(payload)+4))...)
+	out = append(out, hexDigits[(n>>12)&0xf], hexDigits[(n>>8)&0xf], hexDigits[(n>>4)&0xf], hexDigits[n&0xf])
 	out = append(out, payload...)
 	return out
 }
@@ -444,21 +460,45 @@ func readOfsDeltaBase(buffer []byte, start int) (baseOffset int, next int) {
 	return value, offset
 }
 
+// zlibReaderPool reuses flate decompressor state across inflates: a fresh
+// zlib.NewReader per object is the single biggest cost in readPack (the push
+// workload inflates 3 objects per push). Readers are Reset, never Closed —
+// Reset re-initializes the pooled decompressor for the new stream.
+var zlibReaderPool = sync.Pool{}
+
 // inflateAt inflates one zlib stream starting at offset (ending before end)
-// and returns the data plus the offset just past the stream.
-func inflateAt(buffer []byte, offset, end int) ([]byte, int, error) {
+// into a pre-sized buffer and returns the data plus the offset just past the
+// stream (header + deflate data + checksum).
+func inflateAt(buffer []byte, offset, end int, size int) ([]byte, int, error) {
 	r := bytes.NewReader(buffer[offset:end])
-	zr, err := zlib.NewReader(r)
-	if err != nil {
+	var zr io.ReadCloser
+	if v := zlibReaderPool.Get(); v != nil {
+		zr = v.(io.ReadCloser)
+		if err := zr.(zlib.Resetter).Reset(r, nil); err != nil {
+			zlibReaderPool.Put(zr)
+			return nil, 0, err
+		}
+	} else {
+		var err error
+		zr, err = zlib.NewReader(r)
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	out := make([]byte, size)
+	if _, err := io.ReadFull(zr, out); err != nil {
+		zlibReaderPool.Put(zr)
 		return nil, 0, err
 	}
-	data, err := io.ReadAll(zr)
-	zr.Close()
-	if err != nil {
+	// Drain to EOF so the checksum is verified and consumed: the offset past
+	// the stream must include the 4 checksum bytes.
+	if _, err := io.Copy(io.Discard, zr); err != nil {
+		zlibReaderPool.Put(zr)
 		return nil, 0, err
 	}
 	consumed := (end - offset) - r.Len()
-	return data, offset + consumed, nil
+	zlibReaderPool.Put(zr)
+	return out, offset + consumed, nil
 }
 
 // applyDelta applies a git delta instruction stream to a base object's bytes.
@@ -600,7 +640,7 @@ func readPack(pack []byte, resolveBase func(oid string) *gitObject) (*packReadRe
 		} else if _, ok := codeType[tc]; !ok {
 			return nil, fmt.Errorf("pack entry has unknown type code %d", tc)
 		}
-		inflated, nextOff, err := inflateAt(buffer, offset, trailerStart)
+		inflated, nextOff, err := inflateAt(buffer, offset, trailerStart, size)
 		if err != nil {
 			return nil, err
 		}

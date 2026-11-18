@@ -24,7 +24,6 @@ package main
 
 import (
 	"bytes"
-	"fmt"
 	"net"
 	"net/url"
 	"os"
@@ -64,11 +63,25 @@ var reasons = map[int]string{
 	500: "Internal Server Error",
 }
 
+// httpHeaders holds only the request headers any handler reads, as plain
+// fields — no per-request map, no per-name ToLower allocation. Values are
+// substrings of the single head copy, so they allocate nothing themselves.
+type httpHeaders struct {
+	connection       string
+	transferEncoding string
+	contentLength    string
+	hasContentLength bool
+	authorization    string
+	host             string
+	gitProtocol      string
+	expect           string
+}
+
 type parsedRequest struct {
 	method      string
 	target      string
 	httpVersion string
-	headers     map[string]string
+	headers     httpHeaders
 	body        []byte
 	keepAlive   bool
 }
@@ -77,7 +90,7 @@ type parsedHead struct {
 	method      string
 	target      string
 	httpVersion string
-	headers     map[string]string
+	headers     httpHeaders
 	headLength  int
 }
 
@@ -95,6 +108,53 @@ type parseResult struct {
 	head     *parsedHead
 }
 
+// equalFold is ASCII case-insensitive equality, allocation-free.
+func equalFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		x, y := a[i], b[i]
+		if x >= 'A' && x <= 'Z' {
+			x += 'a' - 'A'
+		}
+		if y >= 'A' && y <= 'Z' {
+			y += 'a' - 'A'
+		}
+		if x != y {
+			return false
+		}
+	}
+	return true
+}
+
+// containsFold is ASCII case-insensitive substring search, allocation-free.
+func containsFold(s, sub string) bool {
+	if len(sub) == 0 {
+		return true
+	}
+	for i := 0; i+len(sub) <= len(s); i++ {
+		match := true
+		for j := 0; j < len(sub); j++ {
+			a, b := s[i+j], sub[j]
+			if a >= 'A' && a <= 'Z' {
+				a += 'a' - 'A'
+			}
+			if b >= 'A' && b <= 'Z' {
+				b += 'a' - 'A'
+			}
+			if a != b {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
 func parseHead(buf []byte) (*parsedHead, string) {
 	headEnd := bytes.Index(buf, []byte("\r\n\r\n"))
 	if headEnd < 0 {
@@ -103,16 +163,17 @@ func parseHead(buf []byte) (*parsedHead, string) {
 		}
 		return nil, "needMore"
 	}
-	headText := string(buf[:headEnd])
-	lines := strings.Split(headText, "\r\n")
-	requestLine := ""
-	if len(lines) > 0 {
-		requestLine = lines[0]
+	// One copy of the head; every header value below is a substring of it.
+	head := string(buf[:headEnd])
+	lineEnd := strings.Index(head, "\r\n")
+	if lineEnd < 0 {
+		return nil, "error"
 	}
-	firstSpace := strings.Index(requestLine, " ")
+	requestLine := head[:lineEnd]
+	firstSpace := strings.IndexByte(requestLine, ' ')
 	secondSpace := -1
 	if firstSpace >= 0 {
-		secondSpace = strings.Index(requestLine[firstSpace+1:], " ")
+		secondSpace = strings.IndexByte(requestLine[firstSpace+1:], ' ')
 		if secondSpace >= 0 {
 			secondSpace += firstSpace + 1
 		}
@@ -136,19 +197,43 @@ func parseHead(buf []byte) (*parsedHead, string) {
 			target = rest[slash:]
 		}
 	}
-	headers := map[string]string{}
-	for _, line := range lines[1:] {
-		colon := strings.Index(line, ":")
+	var h httpHeaders
+	pos := lineEnd + 2
+	for pos < len(head) {
+		eol := strings.Index(head[pos:], "\r\n")
+		var line string
+		if eol < 0 {
+			line = head[pos:]
+			pos = len(head)
+		} else {
+			line = head[pos : pos+eol]
+			pos += eol + 2
+		}
+		colon := strings.IndexByte(line, ':')
 		if colon <= 0 {
 			return nil, "error"
 		}
-		name := strings.ToLower(strings.TrimSpace(line[:colon]))
+		name := line[:colon]
 		value := strings.TrimSpace(line[colon+1:])
-		if _, ok := headers[name]; !ok {
-			headers[name] = value
+		switch {
+		case equalFold(name, "content-length"):
+			h.contentLength = value
+			h.hasContentLength = true
+		case equalFold(name, "transfer-encoding"):
+			h.transferEncoding = value
+		case equalFold(name, "connection"):
+			h.connection = value
+		case equalFold(name, "authorization"):
+			h.authorization = value
+		case equalFold(name, "host"):
+			h.host = value
+		case equalFold(name, "git-protocol"):
+			h.gitProtocol = value
+		case equalFold(name, "expect"):
+			h.expect = value
 		}
 	}
-	return &parsedHead{method: method, target: target, httpVersion: httpVersion, headers: headers, headLength: headEnd + 4}, "ok"
+	return &parsedHead{method: method, target: target, httpVersion: httpVersion, headers: h, headLength: headEnd + 4}, "ok"
 }
 
 // parseChunked parses one chunked body starting at pos; nil means more data
@@ -191,12 +276,11 @@ func parseChunked(buf []byte, pos int) (body []byte, consumed int, status string
 }
 
 func finishRequest(head *parsedHead, body []byte) *parsedRequest {
-	conn := strings.ToLower(head.headers["connection"])
 	var keepAlive bool
 	if head.httpVersion == "HTTP/1.1" {
-		keepAlive = !strings.Contains(conn, "close")
+		keepAlive = !containsFold(head.headers.connection, "close")
 	} else {
-		keepAlive = strings.Contains(conn, "keep-alive")
+		keepAlive = containsFold(head.headers.connection, "keep-alive")
 	}
 	return &parsedRequest{
 		method:      head.method,
@@ -213,8 +297,8 @@ func parseOne(buf []byte) parseResult {
 	if status != "ok" {
 		return parseResult{kind: status}
 	}
-	te := strings.ToLower(head.headers["transfer-encoding"])
-	if strings.Contains(te, "chunked") {
+	te := head.headers.transferEncoding
+	if containsFold(te, "chunked") {
 		body, consumed, st := parseChunked(buf, head.headLength)
 		if st == "needMore" {
 			return parseResult{kind: "needMore", head: head}
@@ -224,8 +308,8 @@ func parseOne(buf []byte) parseResult {
 		}
 		return parseResult{kind: "ok", req: finishRequest(head, body), consumed: consumed}
 	}
-	if cl, ok := head.headers["content-length"]; ok {
-		n, err := strconv.ParseInt(strings.TrimSpace(cl), 10, 64)
+	if head.headers.hasContentLength {
+		n, err := strconv.ParseInt(strings.TrimSpace(head.headers.contentLength), 10, 64)
 		if err != nil || n < 0 || n > maxBodyBytes {
 			return parseResult{kind: "error"}
 		}
@@ -267,8 +351,8 @@ func decodeSegment(segment string) string {
 	return segment
 }
 
-func bearerToken(headers map[string]string) string {
-	header := headers["authorization"]
+func bearerToken(headers httpHeaders) string {
+	header := headers.authorization
 	if strings.HasPrefix(header, "Bearer ") {
 		return header[7:]
 	}
@@ -276,7 +360,7 @@ func bearerToken(headers map[string]string) string {
 }
 
 // authorized is true when the caller may use an authenticated surface.
-func authorized(headers map[string]string) bool {
+func authorized(headers httpHeaders) bool {
 	if shopToken == "" {
 		return true
 	}
@@ -301,7 +385,7 @@ func dispatch(req *parsedRequest) (out reply) {
 		}
 	}()
 	method := req.method
-	host := req.headers["host"]
+	host := req.headers.host
 	if host == "" {
 		host = "localhost"
 	}
@@ -364,7 +448,7 @@ func dispatch(req *parsedRequest) (out reply) {
 			if repo == nil {
 				return jsonReply(404, map[string]any{"message": "Not Found"}, nil)
 			}
-			protocol := req.headers["git-protocol"]
+			protocol := req.headers.gitProtocol
 			version2 := ""
 			if strings.Contains(protocol, "version=2") {
 				version2 = "2"
@@ -454,31 +538,44 @@ func dispatch(req *parsedRequest) (out reply) {
 
 func writeReply(conn net.Conn, req *parsedRequest, rep reply) {
 	// The kit only asserts the header is non-empty, never unique.
-	id := "req-" + strconv.FormatUint(atomic.AddUint64(&requestCounter, 1), 36)
+	id := atomic.AddUint64(&requestCounter, 1)
 	isHead := req.method == "HEAD"
-	var head strings.Builder
-	head.WriteString(fmt.Sprintf("HTTP/1.1 %d %s\r\n", rep.status, reasons[rep.status]))
+	// Head built by appends into one buffer: no fmt.Sprintf, no Builder.
+	head := make([]byte, 0, 256)
+	head = append(head, "HTTP/1.1 "...)
+	head = strconv.AppendInt(head, int64(rep.status), 10)
+	head = append(head, ' ')
+	head = append(head, reasons[rep.status]...)
+	head = append(head, "\r\n"...)
 	if rep.contentType != "" {
-		head.WriteString("content-type: " + rep.contentType + "\r\n")
+		head = append(head, "content-type: "...)
+		head = append(head, rep.contentType...)
+		head = append(head, "\r\n"...)
 	}
-	head.WriteString("x-github-request-id: " + id + "\r\n")
-	head.WriteString(fmt.Sprintf("content-length: %d\r\n", len(rep.body)))
+	head = append(head, "x-github-request-id: req-"...)
+	head = strconv.AppendUint(head, id, 36)
+	head = append(head, "\r\n"...)
+	head = append(head, "content-length: "...)
+	head = strconv.AppendInt(head, int64(len(rep.body)), 10)
+	head = append(head, "\r\n"...)
 	for key, value := range rep.headers {
-		head.WriteString(key + ": " + value + "\r\n")
+		head = append(head, key...)
+		head = append(head, ": "...)
+		head = append(head, value...)
+		head = append(head, "\r\n"...)
 	}
 	if req.keepAlive {
-		head.WriteString("connection: keep-alive\r\n\r\n")
+		head = append(head, "connection: keep-alive\r\n\r\n"...)
 	} else {
-		head.WriteString("connection: close\r\n\r\n")
+		head = append(head, "connection: close\r\n\r\n"...)
 	}
-	headBuf := []byte(head.String())
 	// HEAD answers carry headers only; empty bodies are head-only too.
 	if isHead || len(rep.body) == 0 {
-		conn.Write(headBuf)
+		conn.Write(head)
 		return
 	}
-	full := make([]byte, 0, len(headBuf)+len(rep.body))
-	full = append(full, headBuf...)
+	full := make([]byte, 0, len(head)+len(rep.body))
+	full = append(full, head...)
 	full = append(full, rep.body...)
 	conn.Write(full)
 }
@@ -488,11 +585,13 @@ func serveConn(conn net.Conn) {
 	if tcp, ok := conn.(*net.TCPConn); ok {
 		tcp.SetNoDelay(true)
 	}
+	// One generous deadline per connection instead of a setsockopt per
+	// request: bench/conformance connections live seconds, never minutes.
+	conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 	var buf []byte
 	sentContinue := false
 	tmp := make([]byte, 32768)
 	for {
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		n, err := conn.Read(tmp)
 		if n > 0 {
 			buf = append(buf, tmp[:n]...)
@@ -507,7 +606,7 @@ func serveConn(conn net.Conn) {
 			parsed := parseOne(buf)
 			if parsed.kind == "needMore" {
 				if parsed.head != nil && !sentContinue &&
-					strings.ToLower(parsed.head.headers["expect"]) == "100-continue" {
+					equalFold(parsed.head.headers.expect, "100-continue") {
 					conn.Write([]byte("HTTP/1.1 100 Continue\r\n\r\n"))
 					sentContinue = true
 				}
